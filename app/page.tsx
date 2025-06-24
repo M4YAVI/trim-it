@@ -1,103 +1,249 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { open } from '@tauri-apps/plugin-dialog';
+import { useCallback, useEffect, useState } from 'react';
+
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { AnimatePresence, motion } from 'framer-motion';
+
+export default function HomePage() {
+  const [videoSource, setVideoSource] = useState<string>('');
+  const [startTime, setStartTime] = useState<string>('00:00:00');
+  const [endTime, setEndTime] = useState<string>('00:00:10');
+  const [ratio, setRatio] = useState<string>('Original');
+  const [message, setMessage] = useState<string>('');
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [ffmpegStatus, setFfmpegStatus] =
+    useState<string>('Checking FFmpeg...');
+  const [isFfmpegReady, setIsFfmpegReady] = useState<boolean>(false);
+
+  // Effect to check for FFmpeg on component mount
+  useEffect(() => {
+    // Listen for status updates from the Rust backend
+    const unlisten = listen<string>('ffmpeg_status', (event) => {
+      console.log('FFmpeg status update:', event.payload);
+      setFfmpegStatus(event.payload);
+      if (event.payload === 'FFmpeg is ready.') {
+        setIsFfmpegReady(true);
+      }
+    });
+
+    // Invoke the command to start the check/download process
+    invoke('ensure_ffmpeg_is_ready').catch(console.error);
+
+    // Cleanup listener on component unmount
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const handleFileSelect = useCallback(async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [
+          {
+            name: 'Video',
+            extensions: ['mp4', 'mov', 'avi', 'mkv', 'webm'],
+          },
+        ],
+      });
+      if (typeof selected === 'string') {
+        setVideoSource(selected);
+        setMessage(`Selected local file: ${selected.split(/[\\/]/).pop()}`);
+      }
+    } catch (error) {
+      setMessage(`Error selecting file: ${error}`);
+    }
+  }, []);
+
+  const handleTrimVideo = useCallback(async () => {
+    if (!videoSource) {
+      setMessage('Please paste a video URL or select a local file.');
+      return;
+    }
+
+    setIsLoading(true);
+    setMessage('Processing video...');
+    try {
+      const result: string = await invoke('trim_video', {
+        videoSource,
+        startTime,
+        endTime,
+        ratio,
+      });
+      setMessage(result);
+    } catch (error: any) {
+      setMessage(`Error: ${error}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [videoSource, startTime, endTime, ratio]);
+
+  const isUiDisabled = !isFfmpegReady || isLoading;
+
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm/6 text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-[family-name:var(--font-geist-mono)] font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <main className="flex min-h-screen flex-col items-center justify-center p-8 font-mono bg-gradient-to-br from-black via-purple-950 to-black text-white">
+      <AnimatePresence>
+        {!isFfmpegReady && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 bg-black bg-opacity-80 flex flex-col items-center justify-center z-50"
+          >
+            <p className="text-xl mb-4">{ffmpegStatus}</p>
+            {ffmpegStatus.includes('Downloading') && (
+              <div className="w-1/4 h-2 bg-gray-700 rounded-full overflow-hidden">
+                <motion.div
+                  className="h-full bg-white"
+                  initial={{ width: 0 }}
+                  animate={{ width: '100%' }}
+                  transition={{
+                    duration: 1,
+                    repeat: Infinity,
+                    repeatType: 'reverse',
+                    ease: 'easeInOut',
+                  }}
+                />
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+      <motion.h1
+        initial={{ opacity: 0, y: -50 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+        className="text-4xl font-bold mb-8 text-center"
+      >
+        What do you wanna clip?
+      </motion.h1>
+
+      <motion.div
+        initial={{ opacity: 0, scale: 0.9 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ duration: 0.5, delay: 0.2 }}
+        className="w-full max-w-xl bg-black bg-opacity-70 p-8 rounded-lg shadow-lg border border-gray-800"
+      >
+        <fieldset disabled={isUiDisabled} className="space-y-6">
+          <div>
+            <Label htmlFor="video-source" className="sr-only">
+              Video Source
+            </Label>
+            <div className="flex gap-2">
+              <Input
+                id="video-source"
+                placeholder="Paste video url here..."
+                value={videoSource}
+                onChange={(e) => setVideoSource(e.target.value)}
+                className="flex-grow bg-input text-foreground border-gray-700 placeholder:text-gray-500 disabled:opacity-50"
+              />
+              <Button
+                onClick={handleFileSelect}
+                variant="outline"
+                className="bg-primary text-primary-foreground hover:bg-primary/90 border-gray-700 disabled:opacity-50"
+              >
+                Select File
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <Label
+                htmlFor="start-at"
+                className="text-muted-foreground mb-1 block"
+              >
+                Start At
+              </Label>
+              <Input
+                id="start-at"
+                type="text"
+                value={startTime}
+                onChange={(e) => setStartTime(e.target.value)}
+                placeholder="00:00:00"
+                className="bg-input text-foreground border-gray-700 disabled:opacity-50"
+              />
+            </div>
+            <div>
+              <Label
+                htmlFor="end-at"
+                className="text-muted-foreground mb-1 block"
+              >
+                End At
+              </Label>
+              <Input
+                id="end-at"
+                type="text"
+                value={endTime}
+                onChange={(e) => setEndTime(e.target.value)}
+                placeholder="00:00:10"
+                className="bg-input text-foreground border-gray-700 disabled:opacity-50"
+              />
+            </div>
+            <div>
+              <Label
+                htmlFor="ratio"
+                className="text-muted-foreground mb-1 block"
+              >
+                Ratio
+              </Label>
+              <Select
+                value={ratio}
+                onValueChange={setRatio}
+                disabled={isUiDisabled}
+              >
+                <SelectTrigger className="w-full bg-input text-foreground border-gray-700 disabled:opacity-50">
+                  <SelectValue placeholder="Select Ratio" />
+                </SelectTrigger>
+                <SelectContent className="bg-black text-foreground border-gray-700">
+                  <SelectItem value="Original">Original</SelectItem>
+                  <SelectItem value="16:9">16:9 (Landscape)</SelectItem>
+                  <SelectItem value="9:16">9:16 (Portrait)</SelectItem>
+                  <SelectItem value="1:1">1:1 (Square)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <Button
+            onClick={handleTrimVideo}
+            disabled={isUiDisabled}
+            className="w-full bg-primary text-primary-foreground hover:bg-primary/90 py-3 text-lg disabled:opacity-50"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+            {isLoading ? 'Clipping...' : 'Clip Video'}
+          </Button>
+        </fieldset>
+
+        {message && (
+          <motion.p
+            key={message} // Use key to re-trigger animation on message change
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
+            className={`mt-4 text-center break-words ${
+              message.startsWith('Error')
+                ? 'text-destructive'
+                : 'text-green-400'
+            }`}
           >
-            Read our docs
-          </a>
-        </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+            {message}
+          </motion.p>
+        )}
+      </motion.div>
+    </main>
   );
 }
