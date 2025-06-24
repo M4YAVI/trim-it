@@ -5,7 +5,7 @@ use tauri::{Window, Emitter};
 use url::Url;
 use chrono;
 use tempfile;
-use tokio::process::Command; // Added for running yt-dlp
+use tokio::process::Command;
 
 #[tauri::command]
 async fn ensure_ffmpeg_is_ready(window: Window) -> Result<(), String> {
@@ -44,15 +44,33 @@ async fn ensure_ffmpeg_is_ready(window: Window) -> Result<(), String> {
     }
 }
 
-// FIX: New helper function to download videos from YouTube using yt-dlp
-async fn download_youtube_video(url: &str, output_dir: &Path) -> Result<PathBuf, String> {
+// Optimized function to download only the required segment from YouTube
+async fn download_youtube_video_segment(
+    url: &str, 
+    output_dir: &Path, 
+    start_time: &str, 
+    end_time: &str
+) -> Result<PathBuf, String> {
     let output_template = output_dir.join("video.mp4");
 
+    // Convert time format from HH:MM:SS to seconds for yt-dlp
+    let start_seconds = time_to_seconds(start_time)?;
+    let end_seconds = time_to_seconds(end_time)?;
+    
+    // Create download sections parameter
+    let download_sections = format!("*{}-{}", start_seconds, end_seconds);
+
     let status = Command::new("yt-dlp")
+        // Simplified format selection for speed - prefer h264 mp4
         .arg("-f")
-        .arg("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best") // Prefer mp4, fallback to best
-        .arg("--merge-output-format")
-        .arg("mp4")
+        .arg("best[ext=mp4]/best")
+        .arg("--download-sections")
+        .arg(&download_sections)
+        .arg("--force-keyframes-at-cuts")
+        // Speed optimizations
+        .arg("--concurrent-fragments")
+        .arg("4") // Download 4 fragments concurrently
+        .arg("--no-mtime") // Don't set file modification time
         .arg("-o")
         .arg(&output_template)
         .arg(url)
@@ -67,7 +85,7 @@ async fn download_youtube_video(url: &str, output_dir: &Path) -> Result<PathBuf,
         })?;
 
     if !status.success() {
-        return Err("yt-dlp failed to download the video. The URL might be invalid, private, or require a login.".to_string());
+        return Err("yt-dlp failed to download the video segment. The URL might be invalid, private, or require a login.".to_string());
     }
 
     if output_template.exists() {
@@ -77,6 +95,19 @@ async fn download_youtube_video(url: &str, output_dir: &Path) -> Result<PathBuf,
     }
 }
 
+// Helper function to convert HH:MM:SS to seconds
+fn time_to_seconds(time_str: &str) -> Result<f64, String> {
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() != 3 {
+        return Err("Invalid time format. Expected HH:MM:SS".to_string());
+    }
+    
+    let hours: f64 = parts[0].parse().map_err(|_| "Invalid hours")?;
+    let minutes: f64 = parts[1].parse().map_err(|_| "Invalid minutes")?;
+    let seconds: f64 = parts[2].parse().map_err(|_| "Invalid seconds")?;
+    
+    Ok(hours * 3600.0 + minutes * 60.0 + seconds)
+}
 
 #[tauri::command]
 async fn trim_video(
@@ -86,21 +117,30 @@ async fn trim_video(
     ratio: String,
 ) -> Result<String, String> {
     let video_path: PathBuf;
-    let _temp_dir_guard: Option<tempfile::TempDir>; 
+    let _temp_dir_guard: Option<tempfile::TempDir>;
+    let is_youtube_video: bool;
+
+    // Check if it's a YouTube video before consuming the string
+    is_youtube_video = video_source.contains("youtube.com") || video_source.contains("youtu.be");
 
     if video_source.starts_with("http") {
         let temp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
         
-        // FIX: Check for YouTube URLs and use yt-dlp to handle them
-        if video_source.contains("youtube.com") || video_source.contains("youtu.be") {
-            video_path = download_youtube_video(&video_source, temp_dir.path()).await?;
+        // Check for YouTube URLs and download only the segment
+        if is_youtube_video {
+            video_path = download_youtube_video_segment(
+                &video_source, 
+                temp_dir.path(), 
+                &start_time, 
+                &end_time
+            ).await?;
         } else {
-            // For other direct video links, the original download method is fine.
+            // For other direct video links, download the full video
             let parsed_url = Url::parse(&video_source).map_err(|e| format!("Invalid URL: {}", e))?;
             let filename = parsed_url
                 .path_segments()
                 .and_then(|segments| segments.last())
-                .unwrap_or("downloaded_video.mp4") // Ensure a default extension
+                .unwrap_or("downloaded_video.mp4")
                 .to_string();
 
             let temp_path = temp_dir.path().join(filename);
@@ -143,41 +183,43 @@ async fn trim_video(
     
     let mut command = ffmpeg_sidecar::command::FfmpegCommand::new();
     
-    command
-        .input(&video_path.to_string_lossy())
-        .arg("-ss")
-        .arg(&start_time)
-        .arg("-to")
-        .arg(&end_time);
+    // If it's a YouTube video and we only need to copy (no aspect ratio change)
+    if is_youtube_video {
+        if ratio == "Original" {
+            // Just copy the already-trimmed YouTube video
+            command
+                .input(&video_path.to_string_lossy())
+                .args(&["-c", "copy"])
+                .args(&["-movflags", "+faststart"]) // Optimize for web playback
+                .output(&output_path.to_string_lossy())
+                .overwrite();
+        } else {
+            // Apply aspect ratio conversion to the YouTube segment
+            command.input(&video_path.to_string_lossy());
+            apply_aspect_ratio_filter_fast(&mut command, &ratio)?;
+            command.output(&output_path.to_string_lossy()).overwrite();
+        }
+    } else {
+        // For non-YouTube videos or local files, do the full trim + conversion
+        command
+            .input(&video_path.to_string_lossy())
+            .arg("-ss")
+            .arg(&start_time)
+            .arg("-to")
+            .arg(&end_time);
 
-    match ratio.as_str() {
-        "Original" => {
-            command.arg("-c").arg("copy");
+        if ratio == "Original" {
+            command
+                .arg("-c")
+                .arg("copy")
+                .args(&["-avoid_negative_ts", "make_zero"]) // Fix timestamp issues
+                .args(&["-movflags", "+faststart"]); // Optimize for web playback
+        } else {
+            apply_aspect_ratio_filter_fast(&mut command, &ratio)?;
         }
-        "16:9" => {
-            command.args(&[
-                "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
-            ]);
-        }
-        "9:16" => {
-            command.args(&[
-                "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
-            ]);
-        }
-        "1:1" => {
-            command.args(&[
-                "-vf", "scale=720:720:force_original_aspect_ratio=decrease,pad=720:720:(ow-iw)/2:(oh-ih)/2",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k",
-            ]);
-        }
-        _ => return Err(format!("Unsupported ratio: {}", ratio)),
+
+        command.output(&output_path.to_string_lossy()).overwrite();
     }
-
-    command
-        .output(&output_path.to_string_lossy())
-        .overwrite();
 
     let mut child = command
         .spawn()
@@ -192,10 +234,9 @@ async fn trim_video(
                 break;
             }
             ffmpeg_sidecar::event::FfmpegEvent::Error(e) => {
-                // FIX: Capture specific FFmpeg errors for better debugging
                 ffmpeg_errors.push(e.to_string());
             }
-            _ => {} 
+            _ => {}
         }
     }
 
@@ -208,6 +249,48 @@ async fn trim_video(
             Err("FFmpeg failed to create the output file or did not finish successfully.".to_string())
         }
     }
+}
+
+// Optimized helper function for faster video processing
+fn apply_aspect_ratio_filter_fast(command: &mut ffmpeg_sidecar::command::FfmpegCommand, ratio: &str) -> Result<(), String> {
+    // Use ultrafast preset and higher CRF for speed
+    match ratio {
+        "16:9" => {
+            command.args(&[
+                "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                "-c:v", "libx264",
+                "-preset", "ultrafast", // Fastest encoding preset
+                "-crf", "28", // Higher CRF = lower quality but faster
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart", // Optimize for web playback
+            ]);
+        }
+        "9:16" => {
+            command.args(&[
+                "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+            ]);
+        }
+        "1:1" => {
+            command.args(&[
+                "-vf", "scale=720:720:force_original_aspect_ratio=decrease,pad=720:720:(ow-iw)/2:(oh-ih)/2",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+            ]);
+        }
+        _ => return Err(format!("Unsupported ratio: {}", ratio)),
+    }
+    Ok(())
 }
 
 async fn download_video_from_url(url: &str, output_path: &PathBuf) -> Result<(), String> {
