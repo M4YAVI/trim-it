@@ -51,7 +51,7 @@ async fn download_youtube_video_segment(
     start_time: &str, 
     end_time: &str
 ) -> Result<PathBuf, String> {
-    let output_template = output_dir.join("video.mp4");
+    let output_template = output_dir.join("video.%(ext)s");
 
     // Convert time format from HH:MM:SS to seconds for yt-dlp
     let start_seconds = time_to_seconds(start_time)?;
@@ -61,16 +61,22 @@ async fn download_youtube_video_segment(
     let download_sections = format!("*{}-{}", start_seconds, end_seconds);
 
     let status = Command::new("yt-dlp")
-        // Simplified format selection for speed - prefer h264 mp4
+        // Get absolute best quality
         .arg("-f")
-        .arg("best[ext=mp4]/best")
+        .arg("bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best")
+        .arg("--merge-output-format")
+        .arg("mp4")
         .arg("--download-sections")
         .arg(&download_sections)
         .arg("--force-keyframes-at-cuts")
+        // Quality settings
+        .arg("--audio-quality")
+        .arg("0") // Best audio quality
+        .arg("--remux-video")
+        .arg("mp4")
         // Speed optimizations
         .arg("--concurrent-fragments")
-        .arg("4") // Download 4 fragments concurrently
-        .arg("--no-mtime") // Don't set file modification time
+        .arg("4")
         .arg("-o")
         .arg(&output_template)
         .arg(url)
@@ -88,8 +94,10 @@ async fn download_youtube_video_segment(
         return Err("yt-dlp failed to download the video segment. The URL might be invalid, private, or require a login.".to_string());
     }
 
-    if output_template.exists() {
-        Ok(output_template)
+    // Find the downloaded file (it should be video.mp4)
+    let expected_path = output_dir.join("video.mp4");
+    if expected_path.exists() {
+        Ok(expected_path)
     } else {
         Err("yt-dlp ran, but the expected output file was not found.".to_string())
     }
@@ -186,17 +194,18 @@ async fn trim_video(
     // If it's a YouTube video and we only need to copy (no aspect ratio change)
     if is_youtube_video {
         if ratio == "Original" {
-            // Just copy the already-trimmed YouTube video
+            // Just copy the already-trimmed YouTube video with quality preservation
             command
                 .input(&video_path.to_string_lossy())
-                .args(&["-c", "copy"])
-                .args(&["-movflags", "+faststart"]) // Optimize for web playback
+                .args(&["-c:v", "copy"])
+                .args(&["-c:a", "copy"])
+                .args(&["-movflags", "+faststart"])
                 .output(&output_path.to_string_lossy())
                 .overwrite();
         } else {
             // Apply aspect ratio conversion to the YouTube segment
             command.input(&video_path.to_string_lossy());
-            apply_aspect_ratio_filter_fast(&mut command, &ratio)?;
+            apply_aspect_ratio_filter_best_quality(&mut command, &ratio)?;
             command.output(&output_path.to_string_lossy()).overwrite();
         }
     } else {
@@ -210,12 +219,12 @@ async fn trim_video(
 
         if ratio == "Original" {
             command
-                .arg("-c")
-                .arg("copy")
-                .args(&["-avoid_negative_ts", "make_zero"]) // Fix timestamp issues
-                .args(&["-movflags", "+faststart"]); // Optimize for web playback
+                .args(&["-c:v", "copy"])
+                .args(&["-c:a", "copy"])
+                .args(&["-avoid_negative_ts", "make_zero"])
+                .args(&["-movflags", "+faststart"]);
         } else {
-            apply_aspect_ratio_filter_fast(&mut command, &ratio)?;
+            apply_aspect_ratio_filter_best_quality(&mut command, &ratio)?;
         }
 
         command.output(&output_path.to_string_lossy()).overwrite();
@@ -251,40 +260,61 @@ async fn trim_video(
     }
 }
 
-// Optimized helper function for faster video processing
-fn apply_aspect_ratio_filter_fast(command: &mut ffmpeg_sidecar::command::FfmpegCommand, ratio: &str) -> Result<(), String> {
-    // Use ultrafast preset and higher CRF for speed
+// Best quality helper function for video processing
+fn apply_aspect_ratio_filter_best_quality(command: &mut ffmpeg_sidecar::command::FfmpegCommand, ratio: &str) -> Result<(), String> {
+    // Use highest quality settings
     match ratio {
         "16:9" => {
             command.args(&[
-                "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+                "-vf", "scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
                 "-c:v", "libx264",
-                "-preset", "ultrafast", // Fastest encoding preset
-                "-crf", "28", // Higher CRF = lower quality but faster
+                "-preset", "slow", // Better quality than fast
+                "-crf", "17", // Very high quality
+                "-profile:v", "high",
+                "-level", "4.2",
+                "-pix_fmt", "yuv420p",
+                "-g", "30", // Keyframe interval
+                "-bf", "2", // B-frames
                 "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart", // Optimize for web playback
+                "-b:a", "256k", // High audio bitrate
+                "-ar", "48000",
+                "-ac", "2", // Stereo
+                "-movflags", "+faststart",
             ]);
         }
         "9:16" => {
             command.args(&[
-                "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+                "-vf", "scale=1080:1920:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "28",
+                "-preset", "slow",
+                "-crf", "17",
+                "-profile:v", "high",
+                "-level", "4.2",
+                "-pix_fmt", "yuv420p",
+                "-g", "30",
+                "-bf", "2",
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", "256k",
+                "-ar", "48000",
+                "-ac", "2",
                 "-movflags", "+faststart",
             ]);
         }
         "1:1" => {
             command.args(&[
-                "-vf", "scale=720:720:force_original_aspect_ratio=decrease,pad=720:720:(ow-iw)/2:(oh-ih)/2",
+                "-vf", "scale=1080:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "28",
+                "-preset", "slow",
+                "-crf", "17",
+                "-profile:v", "high",
+                "-level", "4.2",
+                "-pix_fmt", "yuv420p",
+                "-g", "30",
+                "-bf", "2",
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", "256k",
+                "-ar", "48000",
+                "-ac", "2",
                 "-movflags", "+faststart",
             ]);
         }
